@@ -1,6 +1,8 @@
 dealerbot.sqlite3
 dealerbot.sqlite3-*
 dealerbot.log
+dealerbot.err.log
+dealerbot.out.log
 .env
 admin.key
 admin_credentials.txt
