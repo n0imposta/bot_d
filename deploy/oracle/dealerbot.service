@@ -1,0 +1,16 @@
+[Unit]
+Description=DealerBot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bot_d
+EnvironmentFile=/opt/bot_d/.env
+ExecStart=/opt/bot_d/.venv/bin/python /opt/bot_d/bot_dealernet.py
+Restart=always
+RestartSec=5
+User=ubuntu
+
+[Install]
+WantedBy=multi-user.target

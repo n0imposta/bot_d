@@ -1,0 +1,2 @@
+python-telegram-bot>=21,<22
+playwright>=1.40,<2
