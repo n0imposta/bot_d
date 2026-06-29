@@ -1,0 +1,10 @@
+dealerbot.sqlite3
+dealerbot.sqlite3-*
+dealerbot.log
+admin.key
+admin_credentials.txt
+session.secret
+ngrok.combined.yml
+reportes/
+comprobantes/
+__pycache__/
