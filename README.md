@@ -1,6 +1,6 @@
 # DealerBot
 
-Bot de Telegram con un panel de administrador único. No existe dashboard público para usuarios: todo se crea y se controla internamente desde admin.
+Bot de Telegram con un panel de administrador unico. No existe dashboard publico para usuarios: todo se crea y se controla internamente desde admin.
 
 ## URL
 
@@ -20,23 +20,23 @@ Para exponer el panel admin:
 ngrok http 127.0.0.1:8000
 ```
 
-La URL pública lleva directo al login del administrador.
+La URL publica lleva directo al login del administrador.
 
 ## Flujo
 
 1. El administrador crea usuarios internos desde `/admin`.
-2. A cada usuario se le asigna un `Bot ID` y un `access token` interno.
+2. A cada usuario se le asigna un `Bot ID`, un `Telegram ID` y un `access token` interno.
 3. El usuario entra al bot de Telegram `@Mi_Info_Service_bot`.
-4. Si su `@telegram` fue registrado por admin, el bot lo reconoce.
-5. El usuario envía un RUT y el bot descuenta `QUERY_COST` token(s).
-6. Si la consulta falla, el sistema devuelve automáticamente el costo.
+4. Si su `Telegram ID` fue registrado por admin, el bot lo reconoce.
+5. El usuario envia un RUT y el bot descuenta `QUERY_COST` token(s).
+6. Si la consulta falla, el sistema devuelve automaticamente el costo.
 
 ## Administracion
 
 En el panel admin puedes:
 
 - Crear usuarios internos.
-- Asignar o limpiar `@telegram`.
+- Asignar o limpiar `Telegram ID`.
 - Ver saldo, estado, Bot ID y token interno.
 - Sumar, restar o fijar tokens.
 - Activar o desactivar cuentas.

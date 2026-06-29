@@ -18,7 +18,22 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ.setdefault(key, value)
+
+
 BASE_DIR = Path(__file__).resolve().parent
+load_env_file(BASE_DIR / ".env")
 DB_PATH = Path(os.getenv("DEALERBOT_DB", BASE_DIR / "dealerbot.sqlite3"))
 DOWNLOAD_DIR = Path(os.getenv("DEALERBOT_DOWNLOAD_DIR", BASE_DIR / "reportes"))
 SESSION_SECRET_FILE = BASE_DIR / "session.secret"
@@ -36,6 +51,7 @@ INITIAL_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@dealerbot.local")
 INITIAL_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 QUERY_COST = int(os.getenv("QUERY_COST", "1"))
 INITIAL_TOKENS = int(os.getenv("INITIAL_TOKENS", "0"))
+DEALERNET_READY = bool(USUARIO_WEB and CLAVE_WEB)
 
 cola_de_trabajo = asyncio.Queue()
 
@@ -76,6 +92,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL UNIQUE,
                 display_name TEXT,
+                telegram_user_id INTEGER UNIQUE,
                 telegram_username TEXT UNIQUE,
                 password_salt TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
@@ -115,6 +132,7 @@ def migrate_users(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     migrations = {
         "display_name": "ALTER TABLE users ADD COLUMN display_name TEXT",
+        "telegram_user_id": "ALTER TABLE users ADD COLUMN telegram_user_id INTEGER",
         "telegram_username": "ALTER TABLE users ADD COLUMN telegram_username TEXT",
     }
     for column, statement in migrations.items():
@@ -162,7 +180,12 @@ def make_bot_id() -> str:
     return "BOT-" + secrets.token_hex(4).upper()
 
 
-def create_user(display_name: str, telegram_username: str | None = None, initial_tokens: int = INITIAL_TOKENS) -> sqlite3.Row:
+def create_user(
+    display_name: str,
+    telegram_user_id: int | None = None,
+    telegram_username: str | None = None,
+    initial_tokens: int = INITIAL_TOKENS,
+) -> sqlite3.Row:
     display_name = display_name.strip()
     if not display_name:
         raise ValueError("Ingresa un nombre o alias valido.")
@@ -170,17 +193,22 @@ def create_user(display_name: str, telegram_username: str | None = None, initial
     slug = "".join(ch for ch in display_name.lower().replace(" ", "_") if ch.isalnum() or ch == "_") or "user"
     internal_email = f"{slug}_{secrets.token_hex(3)}@internal.local"
     salt, digest = hash_password(secrets.token_urlsafe(16))
+    if telegram_user_id is not None and telegram_user_id != "":
+        telegram_user_id = int(str(telegram_user_id).strip())
+    else:
+        telegram_user_id = None
     telegram_username = telegram_username.strip().lstrip("@") if telegram_username else None
     with db() as conn:
         conn.execute(
             """
             INSERT INTO users
-                (email, display_name, telegram_username, password_salt, password_hash, bot_id, access_token, token_balance, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (email, display_name, telegram_user_id, telegram_username, password_salt, password_hash, bot_id, access_token, token_balance, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 internal_email,
                 display_name,
+                telegram_user_id,
                 telegram_username,
                 salt,
                 digest,
@@ -231,14 +259,14 @@ def add_ledger(conn: sqlite3.Connection, user_id: int, delta: int, reason: str, 
     )
 
 
-def get_user_by_chat(chat_id: int) -> sqlite3.Row | None:
+def get_user_by_telegram_id(telegram_user_id: int) -> sqlite3.Row | None:
     with db() as conn:
         return conn.execute(
             """
             SELECT * FROM users
-            WHERE active = 1 AND telegram_chat_id = ?
+            WHERE active = 1 AND telegram_user_id = ?
             """,
-            (chat_id,),
+            (telegram_user_id,),
         ).fetchone()
 
 
@@ -256,22 +284,17 @@ def get_user_by_username(username: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def get_authorized_user(chat_id: int | None, username: str | None) -> sqlite3.Row | None:
-    if chat_id is not None:
+def get_authorized_user(telegram_user_id: int | None, chat_id: int | None = None) -> sqlite3.Row | None:
+    if telegram_user_id is not None:
         with db() as conn:
             user = conn.execute(
-                "SELECT * FROM users WHERE active = 1 AND telegram_chat_id = ?",
-                (chat_id,),
+                "SELECT * FROM users WHERE active = 1 AND telegram_user_id = ?",
+                (telegram_user_id,),
             ).fetchone()
             if user:
-                return user
-    if username:
-        user = get_user_by_username(username)
-        if user:
-            with db() as conn:
-                if chat_id is not None:
+                if chat_id is not None and user["telegram_chat_id"] != chat_id:
                     conn.execute("UPDATE users SET telegram_chat_id = ? WHERE id = ?", (chat_id, user["id"]))
-            return user
+                return user
     return None
 
 
@@ -432,8 +455,8 @@ async def procesador_de_cola(bot_real):
 async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat:
         return
-    username = update.effective_user.username if update.effective_user else None
-    user = get_authorized_user(update.effective_chat.id, username)
+    telegram_user_id = update.effective_user.id if update.effective_user else None
+    user = get_authorized_user(telegram_user_id, update.effective_chat.id)
     if not user:
         await update.effective_message.reply_text("Tu cuenta aun no esta habilitada por administracion.")
         return
@@ -447,11 +470,16 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.message.chat_id
-    username = update.effective_user.username if update.effective_user else None
-    user = get_authorized_user(chat_id, username)
+    telegram_user_id = update.effective_user.id if update.effective_user else None
+    user = get_authorized_user(telegram_user_id, chat_id)
     if not user:
         await update.message.reply_text(
-            "Acceso restringido. Tu cuenta debe ser creada y habilitada por administracion, y tu Telegram debe tener @usuario."
+            "Acceso restringido. Tu cuenta debe ser creada y habilitada por administracion, y tu ID de Telegram debe estar registrado."
+        )
+        return
+    if not DEALERNET_READY:
+        await update.message.reply_text(
+            "El bot esta online, pero el acceso a DealerNet aun no esta configurado por administracion."
         )
         return
 
@@ -475,8 +503,8 @@ async def manejar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
-        username = update.effective_user.username if update.effective_user else None
-        user = get_authorized_user(update.effective_chat.id if update.effective_chat else None, username)
+        telegram_user_id = update.effective_user.id if update.effective_user else None
+        user = get_authorized_user(telegram_user_id, update.effective_chat.id if update.effective_chat else None)
         if user:
             await update.effective_message.reply_text(
                 f"Hola, {user['display_name'] or user['email']}.\n"
@@ -485,7 +513,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.effective_message.reply_text(
             "Bienvenido al Bot DealerNet.\n\n"
-            "Tu acceso lo activa administracion. Si ya fuiste creado y tienes @usuario, envia un RUT para generar el PDF."
+            "Tu acceso lo activa administracion. Si ya fuiste creado y tu ID de Telegram esta registrado, envia un RUT para generar el PDF."
         )
 
 
@@ -665,7 +693,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         with db() as conn:
             users = conn.execute(
                 """
-                SELECT id, email, display_name, telegram_username, bot_id, access_token, telegram_chat_id, token_balance, active, created_at
+                SELECT id, email, display_name, telegram_user_id, telegram_username, bot_id, access_token, telegram_chat_id, token_balance, active, created_at
                 FROM users
                 ORDER BY id DESC
                 """
@@ -677,7 +705,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             f"""
             <tr>
               <td>{u['id']}</td>
-              <td>{html.escape(u['display_name'] or u['email'])}<br><span class="muted">Chat: {u['telegram_chat_id'] or '-'}</span></td>
+              <td>{html.escape(u['display_name'] or u['email'])}</td>
+              <td>{u['telegram_user_id'] or '-'}</td>
               <td>{html.escape('@' + u['telegram_username']) if u['telegram_username'] else '-'}</td>
               <td>{html.escape(u['bot_id'])}</td>
               <td>{u['token_balance']}</td>
@@ -693,9 +722,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 </form>
                 <form method="post" action="/admin/user-action">
                   <input type="hidden" name="user_id" value="{u['id']}">
-                  <input name="telegram_username" placeholder="@telegram">
-                  <button name="action" value="set_telegram">Asignar Telegram</button>
-                  <button name="action" value="clear_telegram">Limpiar Telegram</button>
+                  <input name="telegram_user_id" type="number" placeholder="Telegram ID">
+                  <button name="action" value="set_telegram_id">Asignar ID</button>
+                  <button name="action" value="clear_telegram_id">Limpiar ID</button>
                 </form>
                 <form method="post" action="/admin/user-action">
                   <input type="hidden" name="user_id" value="{u['id']}">
@@ -721,7 +750,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                   <h2>Administracion de usuarios</h2>
                   <form method="post" action="/admin/create-user">
                     <label>Nombre o alias</label><input name="display_name" required>
-                    <label>Telegram username</label><input name="telegram_username" placeholder="@usuario">
+                    <label>Telegram ID</label><input name="telegram_user_id" type="number" placeholder="8325399900">
+                    <label>Telegram username opcional</label><input name="telegram_username" placeholder="@usuario">
                     <label>Tokens iniciales</label><input name="initial_tokens" type="number" min="0" value="0">
                     <p><button>Crear usuario</button></p>
                   </form>
@@ -729,7 +759,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <section class='panel'>
                   <h2>Usuarios</h2>
                   <table>
-                    <tr><th>ID</th><th>Nombre</th><th>Telegram</th><th>Bot ID</th><th>Saldo</th><th>Estado</th><th>Token interno</th><th>Acciones</th></tr>
+                    <tr><th>ID</th><th>Nombre</th><th>Telegram ID</th><th>Username</th><th>Bot ID</th><th>Saldo</th><th>Estado</th><th>Token interno</th><th>Acciones</th></tr>
                     {rows}
                   </table>
                 </section>
@@ -750,9 +780,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self.require_admin():
             return
         form = self.read_form()
-        user_id = int(form.get("user_id", "0"))
+        try:
+            user_id = int(form.get("user_id", "0"))
+        except ValueError:
+            self.redirect("/admin")
+            return
         action = form.get("action", "")
-        token_value = int(form.get("tokens", "0") or "0")
+        try:
+            token_value = int(form.get("tokens", "0") or "0")
+        except ValueError:
+            token_value = 0
         with db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -776,20 +813,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     new_token = make_access_token()
                     conn.execute("UPDATE users SET access_token = ?, telegram_chat_id = NULL WHERE id = ?", (new_token, user_id))
                     add_ledger(conn, user_id, 0, "admin_regenerate_access_token", {})
-                elif action == "set_telegram":
-                    telegram_username = form.get("telegram_username", "").strip().lstrip("@").lower()
-                    if telegram_username:
-                        conn.execute(
-                            "UPDATE users SET telegram_username = ?, telegram_chat_id = NULL WHERE id = ?",
-                            (telegram_username, user_id),
-                        )
-                        add_ledger(conn, user_id, 0, "admin_set_telegram", {"telegram_username": telegram_username})
-                elif action == "clear_telegram":
+                elif action == "set_telegram_id":
+                    telegram_user_id_raw = form.get("telegram_user_id", "").strip()
+                    if telegram_user_id_raw:
+                        try:
+                            telegram_user_id = int(telegram_user_id_raw)
+                        except ValueError:
+                            telegram_user_id = None
+                        if telegram_user_id is not None:
+                            conn.execute(
+                                "UPDATE users SET telegram_user_id = ?, telegram_chat_id = NULL WHERE id = ?",
+                                (telegram_user_id, user_id),
+                            )
+                            add_ledger(conn, user_id, 0, "admin_set_telegram_id", {"telegram_user_id": telegram_user_id})
+                elif action == "clear_telegram_id":
                     conn.execute(
-                        "UPDATE users SET telegram_username = NULL, telegram_chat_id = NULL WHERE id = ?",
+                        "UPDATE users SET telegram_user_id = NULL, telegram_chat_id = NULL WHERE id = ?",
                         (user_id,),
                     )
-                    add_ledger(conn, user_id, 0, "admin_clear_telegram", {})
+                    add_ledger(conn, user_id, 0, "admin_clear_telegram_id", {})
                 elif action == "delete_user":
                     conn.execute("DELETE FROM ledger WHERE user_id = ?", (user_id,))
                     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -811,10 +853,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         form = self.read_form()
         display_name = form.get("display_name", "")
+        telegram_user_id_raw = form.get("telegram_user_id", "")
         telegram_username = form.get("telegram_username", "")
         initial_tokens = int(form.get("initial_tokens", "0") or "0")
         try:
-            create_user(display_name, telegram_username, initial_tokens)
+            telegram_user_id = int(telegram_user_id_raw) if telegram_user_id_raw.strip() else None
+            create_user(display_name, telegram_user_id, telegram_username, initial_tokens)
         except (ValueError, sqlite3.IntegrityError):
             pass
         self.redirect("/admin")
@@ -836,24 +880,12 @@ def start_dashboard() -> ThreadingHTTPServer:
     return server
 
 
-def missing_bot_config() -> list[str]:
-    missing = []
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_TOKEN")
-    if not USUARIO_WEB:
-        missing.append("DEALERNET_USER")
-    if not CLAVE_WEB:
-        missing.append("DEALERNET_PASSWORD")
-    return missing
-
-
 def main():
     init_db()
     start_dashboard()
 
-    missing = missing_bot_config()
-    if missing:
-        print("[!] Bot de Telegram deshabilitado por variables faltantes: " + ", ".join(missing))
+    if not TELEGRAM_TOKEN:
+        print("[!] Bot de Telegram deshabilitado por falta de TELEGRAM_TOKEN.")
         print("[+] El panel admin sigue activo en modo local.")
         print("[->] Presiona Ctrl+C para detener.")
         threading.Event().wait()
